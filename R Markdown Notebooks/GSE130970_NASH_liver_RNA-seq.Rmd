@@ -1,0 +1,278 @@
+---
+title: "GSE130970_NASH_liver_RNA-seq"
+author: "Joshua Soon"
+date: "25 November 2021"
+output: html_document
+---
+
+## Importing data and all necessary libraries
+Data from GEO (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE130970) was imported as merged read count matrix CSV file, and patient meta data was converted to a spaced delimited text file.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(edgeR)
+library(Hmisc)
+library(data.table)
+library(dplyr)
+library(nnet)
+library(DescTools)
+library(ggplot2)
+library(cowplot)
+library(forcats)
+library(parallel)
+library(org.Hs.eg.db)
+
+
+counts <- read.csv("/home/joshua-talo/R-projects/Liver_transcriptomics/data/GSE130970_series_data.csv")
+counts_meta <- read.csv("/home/joshua-talo/R-projects/Liver_transcriptomics/data/GSE130970_series_meta_full.csv", row.names=1)
+
+outliers <- c("X440353.1.X_4", "X440430.1.X_2", "X440435.1.X_3")
+
+counts <- counts[, !(colnames(counts) %in% outliers)]
+counts_meta <- counts_meta[, !(colnames(counts_meta) %in% outliers)]
+```
+
+```{r}
+# Convert Entrez gene IDs from intergers to characters, map to Ensembl IDs, 
+counts$entrez_id <- as.character(counts$entrez_id)
+
+## Bimap interface:
+x <- org.Hs.egENSEMBL
+# Get the entrez gene IDs that are mapped to an Ensembl ID
+mapped_genes <- mappedkeys(x)
+# Convert to a list
+xx <- as.list(x[mapped_genes])
+
+get_Ensemble_ID <- function(entrez){
+  Ensembl_ID <- xx[[entrez]][1]
+}
+
+counts$Ensemble_ID <- as.character(lapply(counts$entrez_id, get_Ensemble_ID))
+# Only accept those with Ensemble ID mappings
+cols <- ncol(counts)
+count_complete <- counts[!counts$Ensemble_ID == "NULL", ]
+
+counts_unique <- count_complete[!duplicated(count_complete$Ensemble_ID), ]
+
+row.names(counts_unique) <- counts_unique$Ensemble_ID
+
+drop_columns <- c("entrez_id", "Ensemble_ID")
+counts <- counts_unique[, !colnames(counts_unique) %in% drop_columns, drop = F]
+```
+
+<br>
+Check if meta data row names match column (sample) names of read count data and preview read counts.
+Convert Entrez ID gene naming to Ensembl IDs.
+<br>
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+all(colnames(counts) == colnames(counts_meta))
+```
+<br>
+<br>
+
+## Preprocessing steps
+1. Create DGEList object
+2. Calculate normalization factors
+3. Filter low-expressed genes, less than 1 to 5 cpm (counts per million)
+<br>
+
+Total read count depth per sample. Typically bulk RNA-seq experiments should have a read count depth of 30 million reads per sample.
+A range of variability of +/- 10% is acceptable.
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Create DGEList object
+gene_counts <- DGEList(counts)
+
+# Calculate normalization factors
+gene_counts <- calcNormFactors(gene_counts)
+
+# Filter low-expressed genes, less than 1 cpm (counts per million)
+cpm_cutoff <- 5
+# Max cpm of each row of cpm(gene_counts), that is less than cutoff
+drop <- which(apply(cpm(gene_counts), 1, max) < cpm_cutoff)
+gene_counts_filtered <- gene_counts[-drop,] 
+
+total_filtered_counts <- colSums(gene_counts_filtered$counts)
+names(total_filtered_counts) <- colnames(counts)
+total_filtered_counts_df <- data.frame(total_filtered_counts)
+total_filtered_counts_df <- tibble::rownames_to_column(total_filtered_counts_df, "Sample_name")
+plot_counts <- ggplot(total_filtered_counts_df, aes(x = Sample_name, y = total_filtered_counts)) + geom_bar(stat="identity")
+plot_counts
+```
+<br>
+
+Size of gene read count matrix after filtering
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+dim(gene_counts_filtered)
+```
+<br>
+<br>
+
+## Grouping of samples with various clinical histopathological features
+### Groups will be used for multinomial and ordinal logistic regression fitting
+A) NAFLD activity score Levels: 0 1 2 3 4 5 6
+B) Lobular inflammation grade Levels: 0 1 2
+C) Cytological ballooning grade Levels: 0 1 2
+D) Steatosis grade Levels: 0 1 2 3
+E) Fibrosis stage Levels: 0 1 2 3 4
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+counts_meta_transposed <- transpose(counts_meta)
+colnames(counts_meta_transposed) <- rownames(counts_meta)
+rownames(counts_meta_transposed) <- colnames(counts_meta)
+```
+<br>
+
+## Normalized counts
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Normalise varying library sizes and obtain counts per million
+limma_voom_normalized <- cpm(gene_counts_filtered, log=F)
+limma_voom_normalized_log <- cpm(gene_counts_filtered, log=TRUE, prior.count=1)
+limma_voom_normalized[1:10, 1:5]
+```
+<br>
+
+## Adding appropriate sample groupings to log normalised and normalised CPM matrix
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Convert matrix to data frame
+limma_voom_normalized_df <- data.frame(limma_voom_normalized)
+
+# Renaming sample names to GEO naming scheme
+colnames(limma_voom_normalized_df) <-
+  counts_meta_transposed$`!Sample_geo_accession`[match(colnames(gene_counts_filtered), rownames(counts_meta_transposed))]
+rownames(counts_meta_transposed) <- counts_meta_transposed$`!Sample_geo_accession`
+
+# Transpose count data frame such that samples become rows
+t_limma_voom_normalized_df <- transpose(limma_voom_normalized_df)
+colnames(t_limma_voom_normalized_df) <- rownames(limma_voom_normalized_df)
+rownames(t_limma_voom_normalized_df) <- colnames(limma_voom_normalized_df)
+
+# Converted to factor for categorical
+NAS <- factor(counts_meta_transposed[, 'NAFLD activity score'])
+LIG <- factor(counts_meta_transposed[, 'Lobular inflammation grade'])
+CBG <- factor(counts_meta_transposed[, 'Cytological ballooning grade'])
+SG <- factor(counts_meta_transposed[, 'Steatosis grade'])
+FS <- factor(counts_meta_transposed[, 'Fibrosis stage'])
+
+# Adding sample names to each clinical histopathological feathure
+names(NAS) <- rownames(counts_meta_transposed)
+names(LIG) <- rownames(counts_meta_transposed)
+names(CBG) <- rownames(counts_meta_transposed)
+names(SG) <- rownames(counts_meta_transposed)
+names(FS) <- rownames(counts_meta_transposed)
+
+# Matched locations of disease_stage and counts data frame, by matching sample names
+matched_disease_NAS <- match(names(NAS), rownames(t_limma_voom_normalized_df))
+matched_disease_LIG <- match(names(LIG), rownames(t_limma_voom_normalized_df))
+matched_disease_CBG <- match(names(CBG), rownames(t_limma_voom_normalized_df))
+matched_disease_SG <- match(names(SG), rownames(t_limma_voom_normalized_df))
+matched_disease_FS <- match(names(FS), rownames(t_limma_voom_normalized_df))
+
+# Bind metadata column to first column of transposed count data frame
+RNA_seq_with_NAS <- cbind(NAS[matched_disease_NAS], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_NAS)[1] <- "NAFLD_activity_score"
+RNA_seq_with_LIG <- cbind(LIG[matched_disease_LIG], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_LIG)[1] <- "Lobular_inflammation_grade"
+RNA_seq_with_CBG <- cbind(CBG[matched_disease_CBG], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_CBG)[1] <- "Cytological_ballooning_grade"
+RNA_seq_with_SG <- cbind(SG[matched_disease_SG], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_SG)[1] <- "Steatosis_grade"
+RNA_seq_with_FS <- cbind(FS[matched_disease_FS], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_FS)[1] <- "Fibrosis_stage"
+
+
+
+# Arranged data frame by NASH stage or fibrosis stage column
+# Full NASH stages
+RNA_seq_with_NAS_arranged <- RNA_seq_with_NAS %>% arrange(NAFLD_activity_score)
+RNA_seq_with_NAS_arranged$NAFLD_activity_score <- 
+  relevel(as.factor(RNA_seq_with_NAS_arranged$NAFLD_activity_score), ref = "NAS_0")
+print("NAFLD activity score groupings")
+levels(RNA_seq_with_NAS_arranged$NAFLD_activity_score)
+
+RNA_seq_with_LIG_arranged <- RNA_seq_with_LIG %>% arrange(Lobular_inflammation_grade)
+RNA_seq_with_LIG_arranged$Lobular_inflammation_grade <- 
+  relevel(as.factor(RNA_seq_with_LIG_arranged$Lobular_inflammation_grade), ref = "LIG_0")
+print("Lobular inflammation grade groupings")
+levels(RNA_seq_with_LIG_arranged$Lobular_inflammation_grade)
+
+RNA_seq_with_CBG_arranged <- RNA_seq_with_CBG %>% arrange(Cytological_ballooning_grade)
+RNA_seq_with_CBG_arranged$Cytological_ballooning_grade <- 
+  relevel(as.factor(RNA_seq_with_CBG_arranged$Cytological_ballooning_grade), ref = "CBG_0")
+print("Cytological ballooning grade groupings")
+levels(RNA_seq_with_CBG_arranged$Cytological_ballooning_grade)
+
+RNA_seq_with_SG_arranged <- RNA_seq_with_SG %>% arrange(Steatosis_grade)
+RNA_seq_with_SG_arranged$Steatosis_grade <- 
+  relevel(as.factor(RNA_seq_with_SG_arranged$Steatosis_grade), ref = "SG_0")
+print("Steatosis grade groupings")
+levels(RNA_seq_with_SG_arranged$Steatosis_grade)
+
+RNA_seq_with_FS_arranged <- RNA_seq_with_FS %>% arrange(Fibrosis_stage)
+RNA_seq_with_FS_arranged$Fibrosis_stage <- 
+  relevel(as.factor(RNA_seq_with_FS_arranged$Fibrosis_stage), ref = "FS_0")
+print("Fibrosis stage groupings")
+levels(RNA_seq_with_FS_arranged$Fibrosis_stage)
+
+```
+<br>
+
+
+Some MDS visualisations of groupings
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+plotMDS(gene_counts_filtered, col = as.numeric(NAS), labels = NAS)
+plotMDS(gene_counts_filtered, col = as.numeric(LIG), labels = LIG)
+plotMDS(gene_counts_filtered, col = as.numeric(CBG), labels = CBG)
+plotMDS(gene_counts_filtered, col = as.numeric(SG), labels = SG)
+plotMDS(gene_counts_filtered, col = as.numeric(FS), labels = FS)
+
+plotMDS(gene_counts_filtered, col = as.numeric(NAS))
+```
+<br>
+
+## Functionalize and interatively fit multinomial logistic regression model for:
+### NAS, Lobular inflammation grade, Cytological ballooning grade, Steatosis grade, Fibrosis stage
+### Ranking genes according to goodness of fit metrics, Chi-sq and p-value.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+source("automated_regression_report.R")
+
+regressors <- setdiff(colnames(RNA_seq_with_NAS_arranged), "NAFLD_activity_score")
+# Cut off for genes with normalised CPM greater than 10
+regressors_cutoff <- regressors[colMeans(RNA_seq_with_NAS_arranged[, regressors]) > 10]
+
+all_mlr_olr <- mclapply(regressors_cutoff, function(x){
+# Wrap fit_mlr_olr function inside anonymous function to allow default arguments for dataset and conditions
+# But only mclapply to first argument x which is gene ID
+# This allows wrapped function to be applied to list of genes in regressors list
+result_full <- fit_mlr_olr(x, data_set = RNA_seq_with_NAS_arranged, conditions = "NAFLD_activity_score")
+result_full
+}, mc.cores = 16)
+
+# Wrap everything in a function that calls the iterative regression fitting function
+# Regression statistics for NAFL activity score, Lobular inflammation grade, Cytological ballooning grade, Steatosis & Fibrosis grade
+NAS_regression <- automated_regression_report(RNA_seq_with_NAS_arranged)
+LIG_regression <- automated_regression_report(RNA_seq_with_LIG_arranged)
+CBG_regression <- automated_regression_report(RNA_seq_with_CBG_arranged)
+SG_regression <- automated_regression_report(RNA_seq_with_SG_arranged)
+FS_regression <- automated_regression_report(RNA_seq_with_FS_arranged)
+
+write.csv(NAS_regression,"./GSE130970_NAS_regression_genes.csv", row.names = F)
+write.csv(LIG_regression,"./GSE130970_LIG_regression_genes.csv", row.names = F)
+write.csv(CBG_regression,"./GSE130970_CBG_regression_genes.csv", row.names = F)
+write.csv(SG_regression,"./GSE130970_SG_regression_genes.csv", row.names = F)
+write.csv(FS_regression,"./GSE130970_FS_regression_genes.csv", row.names = F)
+
+NAS_genes <- NAS_regression$ENSEMBL_ID
+LIG_genes <- LIG_regression$ENSEMBL_ID
+CBG_genes <- CBG_regression$ENSEMBL_ID
+SG_genes <- SG_regression$ENSEMBL_ID
+FS_genes <- FS_regression$ENSEMBL_ID
+
+common_genes <- Reduce(intersect, list(NAS_genes, LIG_genes, CBG_genes, SG_genes, FS_genes))
+
+common_genes_df <- NAS_regression[NAS_regression$ENSEMBL_ID %in% common_genes, ]
+
+write.csv(common_genes_df,"./GSE130970_all_intersect_regression_genes.csv", row.names = F)
+
+```
+<br>

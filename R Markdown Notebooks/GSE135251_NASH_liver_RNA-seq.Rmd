@@ -1,0 +1,980 @@
+---
+title: "GSE135251_NASH_liver_RNA-seq"
+author: "Joshua Soon"
+date: "23 November 2021"
+output: html_document
+---
+
+## Importing data and all necessary libraries
+Data from GEO (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE135251) was imported as individual sample read count matrices and merged together with python script. Merged data was converted to CSV file, and patient meta data was converted to a spaced delimited text file.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(edgeR)
+library(Hmisc)
+library(data.table)
+library(dplyr)
+library(nnet)
+library(DescTools)
+library(ggplot2)
+library(cowplot)
+library(forcats)
+library(parallel)
+
+counts <- read.csv("/home/joshua-talo/R-projects/Liver_transcriptomics/data/GSE135251_series_data.csv", row.names = 1)
+counts_meta <- read.table("/home/joshua-talo/R-projects/Liver_transcriptomics/data/GSE135251_series_meta_full.txt", header=T, row.names = 1)
+```
+<br>
+Check if meta data row names match column (sample) names of read count data and preview read counts.
+<br>
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Renaming sample IDs to GEO format identifiers and Entrez gene IDs to Ensembl gene IDs
+
+
+
+all(colnames(counts) == rownames(counts_meta))
+```
+<br>
+<br>
+
+## Preprocessing steps
+1. Create DGEList object
+2. Calculate normalization factors
+3. Filter low-expressed genes, less than 1 to 5 cpm (counts per million)
+<br>
+
+Total read count depth per sample. Typically bulk RNA-seq experiments should have a read count depth of 30 million reads per sample.
+A range of variability of +/- 10% is acceptable.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Create DGEList object
+gene_counts <- DGEList(counts)
+
+# Calculate normalization factors
+gene_counts <- calcNormFactors(gene_counts)
+
+# Filter low-expressed genes, less than 1 cpm (counts per million)
+cpm_cutoff <- 5
+# Max cpm of each row of cpm(gene_counts), that is less than cutoff
+drop <- which(apply(cpm(gene_counts), 1, max) < cpm_cutoff)
+gene_counts_filtered <- gene_counts[-drop,] 
+
+total_filtered_counts <- colSums(gene_counts_filtered$counts)
+names(total_filtered_counts) <- colnames(counts)
+total_filtered_counts_df <- data.frame(total_filtered_counts)
+total_filtered_counts_df <- tibble::rownames_to_column(total_filtered_counts_df, "Sample_name")
+plot_counts <- ggplot(total_filtered_counts_df, aes(x = Sample_name, y = total_filtered_counts)) + geom_bar(stat="identity")
+plot_counts
+```
+<br>
+
+Size of gene read count matrix after filtering
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+dim(gene_counts_filtered)
+```
+<br>
+<br>
+
+## Grouping of samples for differential expression comparions
+### Groups will be used for limma-voom model fitting to get Log2Fold-change, p-values and adjusted p-values
+A) NASH stages are grouped separately from 0-1, 2, 3 and 4.
+B) All NASH stages are grouped together as one bigger NASH group.
+C) Fibrosis stages 1 to 4, against healthy controls.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+NASH_score_groups <- factor(counts_meta$Disease_grouping_in_study)  # Converted to factor for categorical
+
+NASH_score_collapsed_groups <- NASH_score_groups
+# fct_recode collapses all NASH stages factors into single NASH factor
+NASH_score_collapsed_groups <- fct_recode(NASH_score_collapsed_groups,
+                                          NASH = "NASH_F0_F1",
+                                          NASH = "NASH_F2",
+                                          NASH = "NASH_F3",
+                                          NASH = "NASH_F4")
+# Result of arranged_NASH_collapsed$Disease_stage is a factor column with 3 levels: control NAFL NASH
+
+Fibrosis_score_groups <- factor(counts_meta$Fibrosis_stage)
+```
+<br>
+
+Some MDS visualisations of groupings
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+plotMDS(gene_counts_filtered, col = as.numeric(NASH_score_groups), labels = NASH_score_groups)
+plotMDS(gene_counts_filtered, col = as.numeric(NASH_score_collapsed_groups), labels = NASH_score_collapsed_groups)
+plotMDS(gene_counts_filtered, col = as.numeric(Fibrosis_score_groups), labels = Fibrosis_score_groups)
+```
+<br>
+
+## Normalized counts and plotting gene expression trends across:
+A) NASH stages (healthy control, NAFLD, NASH_F0_F1, NASH_F2, NASH_F3. NASH_F4)
+B) Collapsed NASH stages (healthy control, NAFLD and NASH)
+C) Fibrosis stages 0, 1 to 4.
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Normalise varying library sizes and obtain counts per million
+limma_voom_normalized <- cpm(gene_counts_filtered, log=F)
+limma_voom_normalized_log <- cpm(gene_counts_filtered, log=TRUE, prior.count=1)
+limma_voom_normalized[1:10, 1:5]
+```
+<br>
+
+## Adding appropriate sample groupings to log normalised CPM matrix
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Convert matrix to data frame
+limma_voom_normalized_df <- data.frame(limma_voom_normalized)
+# Obtain disease stages full and collapsed, as well as NASH stages from meta data
+# Rename elements with sample names from meta data
+disease_stage_full <- NASH_score_groups
+names(disease_stage_full) <- rownames(counts_meta)
+
+disease_stage_collapsed <- NASH_score_collapsed_groups
+names(disease_stage_collapsed) <- rownames(counts_meta)
+
+fibrosis_stage_full <- Fibrosis_score_groups
+names(fibrosis_stage_full) <- rownames(counts_meta)
+
+# Transpose count data frame such that samples become rows
+t_limma_voom_normalized_df <- transpose(limma_voom_normalized_df)
+colnames(t_limma_voom_normalized_df) <- rownames(limma_voom_normalized_df)
+rownames(t_limma_voom_normalized_df) <- colnames(limma_voom_normalized_df)
+
+# Matched locations of disease_stage and counts data frame, by matching sample names
+matched_disease_stage_full <- match(names(disease_stage_full), rownames(t_limma_voom_normalized_df))
+matched_disease_stage_collapsed <- match(names(disease_stage_collapsed), rownames(t_limma_voom_normalized_df))
+matched_fibrosis_stage_full <- match(names(fibrosis_stage_full), rownames(t_limma_voom_normalized_df))
+
+
+# Bind metadata column to first column of transposed count data frame
+RNA_seq_with_full_NASH_stages <- cbind(disease_stage_full[matched_disease_stage_full], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_full_NASH_stages)[1] <- "NASH_stages_full"
+
+RNA_seq_with_collapsed_NASH_stages <- cbind(disease_stage_collapsed[matched_disease_stage_collapsed], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_collapsed_NASH_stages)[1] <- "NASH_stages_collapsed"
+
+RNA_seq_with_fibrosis_stages <- cbind(fibrosis_stage_full[matched_fibrosis_stage_full], t_limma_voom_normalized_df)
+colnames(RNA_seq_with_fibrosis_stages)[1] <- "Fibrosis_stages"
+
+# Arranged data frame by NASH stage or fibrosis stage column
+# Full NASH stages
+RNA_seq_with_full_NASH_stages_arranged <- RNA_seq_with_full_NASH_stages %>% arrange(NASH_stages_full)
+RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full <- 
+  relevel(as.factor(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full), ref = "control")
+print("Full NASH staging groups")
+levels(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full)
+
+# Collapsed NASH stages
+RNA_seq_with_collapsed_NASH_stages_arranged <- RNA_seq_with_collapsed_NASH_stages %>% arrange(NASH_stages_collapsed)
+RNA_seq_with_collapsed_NASH_stages_arranged$NASH_stages_collapsed <-
+  relevel(as.factor(RNA_seq_with_collapsed_NASH_stages_arranged$NASH_stages_collapsed), ref = "control")
+print("Collapsed NASH staging groups")
+levels(RNA_seq_with_collapsed_NASH_stages_arranged$NASH_stages_collapsed)
+
+# Fibrosis stages
+RNA_seq_with_fibrosis_stages_arranged <- RNA_seq_with_fibrosis_stages %>% arrange(Fibrosis_stages)
+RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages <-
+  relevel(as.factor(RNA_seq_with_fibrosis_stages$Fibrosis_stages), ref = "fibrosis_stage_0")
+print("Fibrosis staging groups")
+levels(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages)
+```
+<br>
+
+## Plotting and visualisation of gene expression patterns across varying conditions
+
+### Gene expression patterns across NASH stage progression
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Reg1 / ZC3H12A
+plot_ZC3H12A <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000163874, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("Reg1 / ZC3H12A normalized CPM") +
+  expand_limits(y = 0)
+plot_ZC3H12A
+
+# AKR1B10
+plot_AKR1B10 <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000198074, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("AKR1B10 normalized CPM") +
+  expand_limits(y = 0)
+plot_AKR1B10
+
+# ANKRD29
+plot_ANKRD29 <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000154065, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("ANKRD29 normalized CPM") +
+  expand_limits(y = 0)
+plot_ANKRD29
+
+# CCL20
+plot_CCL20 <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000115009, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("CCL20 normalized CPM") +
+  expand_limits(y = 0)
+plot_CCL20
+
+###################################################################################################################################
+# Genes as targets from MEL
+plot_PREB <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000138073, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("PREB normalized CPM") +
+  expand_limits(y = 0)
+plot_PREB
+
+plot_MEAF6 <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000163875, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("MEAF6 normalized CPM") +
+  expand_limits(y = 0)
+plot_MEAF6
+
+plot_APCS <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000132703, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("APCS normalized CPM") +
+  expand_limits(y = 0)
+plot_APCS
+
+plot_PRDX1 <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000117450, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) + # Add + expand_limits(y = 0) to force y-axis to start from 0.
+  ylab("PRDX1 normalized CPM") +
+  expand_limits(y = 0)
+plot_PRDX1
+
+plot_NEDD4L <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000049759, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("NEDD4L normalized CPM") +
+  expand_limits(y = 0)
+plot_NEDD4L
+
+```
+<br>
+<br>
+
+### Gene expression patterns between healthy controls, NAFLD and NASH
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Reg1 / ZC3H12A
+plot_ZC3H12A_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000163874,
+                                                                          fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("Reg1 / ZC3H12A normalized CPM") +
+  expand_limits(y = 0)
+plot_ZC3H12A_2
+
+# AKR1B10
+plot_AKR1B10_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000198074,
+                                                                          fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("AKR1B10 normalized CPM") +
+  expand_limits(y = 0)
+plot_AKR1B10_2
+
+# ANKRD29
+plot_ANKRD29_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000154065,
+                                                                          fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("ANKRD29 normalized CPM") +
+  expand_limits(y = 0)
+plot_ANKRD29_2
+
+# CCL20
+plot_CCL20_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000115009,
+                                                                        fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("CCL20 normalized CPM") +
+  expand_limits(y = 0)
+plot_CCL20_2
+
+###################################################################################################################################
+# Genes as targets from MEL
+plot_PREB_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000138073,
+                                                                       fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("PREB normalized CPM") +
+  expand_limits(y = 0)
+plot_PREB_2
+
+plot_MEAF6_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000163875,
+                                                                        fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("MEAF6 normalized CPM") +
+  expand_limits(y = 0)
+plot_MEAF6_2
+
+plot_APCS_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000132703,
+                                                                       fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("APCS normalized CPM") +
+  expand_limits(y = 0)
+plot_APCS_2
+
+plot_PRDX1_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000117450,
+                                                                        fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) + # Add + expand_limits(y = 0) to force y-axis to start from 0.
+  ylab("PRDX1 normalized CPM") +
+  expand_limits(y = 0)
+plot_PRDX1_2
+
+plot_NEDD4L_2 <- ggplot(RNA_seq_with_collapsed_NASH_stages_arranged, aes(x = NASH_stages_collapsed, y = ENSG00000049759,
+                                                                         fill = NASH_stages_collapsed)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("NEDD4L normalized CPM") +
+  expand_limits(y = 0)
+plot_NEDD4L_2
+
+plot_grid(plot_MEAF6_2 + ggplot2::theme(legend.position = "none"),
+          plot_NEDD4L_2 + ggplot2::theme(legend.position = "none"),
+          plot_PRDX1_2 + ggplot2::theme(legend.position = "none"),
+          plot_APCS_2 + ggplot2::theme(legend.position = "none"),
+          plot_PREB_2 + ggplot2::theme(legend.position = "none"),
+          nrow = 1)
+
+```
+<br>
+<br>
+
+### Gene expression patterns across fibrosis stage progression
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Reg1 / ZC3H12A
+plot_ZC3H12A_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000163874, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("Reg1 / ZC3H12A normalized CPM") +
+  expand_limits(y = 0)
+plot_ZC3H12A_3
+
+# AKR1B10
+plot_AKR1B10_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000198074, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("AKR1B10 normalized CPM") +
+  expand_limits(y = 0)
+plot_AKR1B10_3
+
+# ANKRD29
+plot_ANKRD29_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000154065, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("ANKRD29 normalized CPM") +
+  expand_limits(y = 0)
+plot_ANKRD29_3
+
+# CCL20
+plot_CCL20_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000115009, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("CCL20 normalized CPM") +
+  expand_limits(y = 0)
+plot_CCL20_3
+
+###################################################################################################################################
+# Genes as targets from MEL
+plot_PREB_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000138073, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("PREB normalized CPM") +
+  expand_limits(y = 0)
+plot_PREB_3
+
+plot_MEAF6_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000163875, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("MEAF6 normalized CPM") +
+  expand_limits(y = 0)
+plot_MEAF6_3
+
+plot_APCS_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000132703, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("APCS normalized CPM") +
+  expand_limits(y = 0)
+plot_APCS_3
+
+plot_PRDX1_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000117450, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) + # Add + expand_limits(y = 0) to force y-axis to start from 0.
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("PRDX1 normalized CPM") +
+  expand_limits(y = 0)
+plot_PRDX1_3
+
+plot_NEDD4L_3 <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000049759, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  ylab("NEDD4L normalized CPM") +
+  expand_limits(y = 0)
+plot_NEDD4L_3
+```
+<br>
+
+## Multinomial logistic regression for each gene
+### Fitting a logistic regression model for gene expression changes across:
+A) Overall disease stage progression
+B) Fibrosis stage progression
+
+### Logistic regression model for overall disease stage progression
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# mlr = multinomial logistic regression
+#For control Reg1 / ZC3H12A
+ZC3H12A_mlr <- multinom(NASH_stages_full ~ ENSG00000163874, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(ZC3H12A_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(ZC3H12A_mlr), simulate.p.value = TRUE, B = 100000)
+
+#For AKR1B10 gene
+AKR1B10_mlr <- multinom(NASH_stages_full ~ ENSG00000198074, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(AKR1B10_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(AKR1B10_mlr), simulate.p.value = TRUE, B = 100000)
+
+#For ANKRD29 gene
+ANKRD29_mlr <- multinom(NASH_stages_full ~ ENSG00000154065, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(ANKRD29_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(ANKRD29_mlr), simulate.p.value = TRUE, B = 100000)
+
+#For CCL20 gene
+CCL20_mlr <- multinom(NASH_stages_full ~ ENSG00000115009, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(CCL20_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(CCL20_mlr), simulate.p.value = TRUE, B = 100000)
+
+###################################################################################################################################
+
+# For preb gene
+preb_mlr <- multinom(NASH_stages_full ~ ENSG00000138073, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(preb_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(preb_mlr), simulate.p.value = TRUE, B = 100000)
+
+# For APCS gene
+APCS_mlr <- multinom(NASH_stages_full ~ ENSG00000132703, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(APCS_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(APCS_mlr), simulate.p.value = TRUE, B = 100000)
+
+# For PRDX1 gene
+PRDX1_mlr <- multinom(NASH_stages_full ~ ENSG00000117450, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(PRDX1_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(PRDX1_mlr), simulate.p.value = TRUE, B = 100000)
+
+# For NEDD4L gene
+NEDD4L_mlr <- multinom(NASH_stages_full ~ ENSG00000049759, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(NEDD4L_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(NEDD4L_mlr), simulate.p.value = TRUE, B = 100000)
+
+# For MEAF6 gene
+MEAF6_mlr <- multinom(NASH_stages_full ~ ENSG00000163875, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(MEAF6_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(MEAF6_mlr), simulate.p.value = TRUE, B = 100000)
+
+```
+<br>
+
+### Logistic regression model for fibrosis stage progression
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# mlr = multinomial logistic regression
+#For control Reg1 / ZC3H12A
+ZC3H12A_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000163874, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(ZC3H12A_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(ZC3H12A_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+#For AKR1B10 gene
+AKR1B10_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000198074, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(AKR1B10_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(AKR1B10_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+#For ANKRD29 gene
+ANKRD29_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000154065, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(ANKRD29_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(ANKRD29_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+#For CCL20 gene
+CCL20_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000115009, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(CCL20_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(CCL20_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+###################################################################################################################################
+
+# For preb gene
+preb_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000138073, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(preb_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(preb_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+# For APCS gene
+APCS_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000132703, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(APCS_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(APCS_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+# For PRDX1 gene
+PRDX1_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000117450, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(PRDX1_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(PRDX1_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+# For NEDD4L gene
+NEDD4L_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000049759, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(NEDD4L_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(NEDD4L_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+
+# For MEAF6 gene
+MEAF6_mlr_fibrosis <- multinom(Fibrosis_stages ~ ENSG00000163875, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(MEAF6_mlr_fibrosis)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(MEAF6_mlr_fibrosis), simulate.p.value = TRUE, B = 100000)
+```
+<br>
+
+
+## Differential Expression with Limma-Voom
+Group by group comparisons, 1) Healthy control, 2) NAFLD & 3) NASH.
+Voom transformation and calculation of variance weights.
+Specify the model to be fitted. We do this before using voom since voom uses variances of the model residuals (observed - fitted).
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+mm <- model.matrix(~0 + NASH_score_collapsed_groups)
+# The above specifies a model where each coefficient corresponds to a group mean
+voom_transformed_counts <- voom(gene_counts_filtered, mm, plot = T)
+```
+<br>
+
+lmFit fits a linear model using weighted least squares for each gene
+Comparisons between groups (log fold-changes) are obtained as contrasts of these fitted linear models
+Estimate contrast for each gene
+Empirical Bayes smoothing of standard errors
+(shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+fitted_linear_model <- lmFit(voom_transformed_counts, mm)
+head(coef(fitted_linear_model))
+```
+<br>
+
+### NAFLD vs Healthy control
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(org.Hs.eg.db)
+
+NAFLD_contrast <- makeContrasts(NASH_score_collapsed_groupsNAFL - NASH_score_collapsed_groupscontrol,
+                                levels = colnames(coef(fitted_linear_model)))
+NAFLD_contrast
+NAFLD_contrast_fitted <- contrasts.fit(fitted_linear_model, NAFLD_contrast)
+NAFLD_contrast_fitted <- eBayes(NAFLD_contrast_fitted)
+NAFLD_vs_Control_top_table <- topTable(NAFLD_contrast_fitted, sort.by = "P", n = Inf)
+head(NAFLD_vs_Control_top_table, 10) # Top 10 genes
+NAFLD_vs_Control_top_table_p_value_cutoff <- NAFLD_vs_Control_top_table
+NAFLD_vs_Control_top_table_p_value_cutoff <-
+  NAFLD_vs_Control_top_table_p_value_cutoff[NAFLD_vs_Control_top_table_p_value_cutoff$adj.P.Val < 0.05, ]
+NAFLD_vs_Control_top_table_p_value_cutoff <-
+  NAFLD_vs_Control_top_table_p_value_cutoff[abs(NAFLD_vs_Control_top_table_p_value_cutoff$logFC) > 1, ]
+
+colnames(NAFLD_vs_Control_top_table_p_value_cutoff)[colnames(NAFLD_vs_Control_top_table_p_value_cutoff) == 'AveExpr'] <- 'AveExpr_Log2_CPM'
+
+NAFLD_vs_Control_top_table_p_value_cutoff <- tibble::rownames_to_column(NAFLD_vs_Control_top_table_p_value_cutoff, "ENSEMBL_ID")
+
+annots_1 <- AnnotationDbi::select(org.Hs.eg.db, keys = NAFLD_vs_Control_top_table_p_value_cutoff$ENSEMBL_ID,
+                                  columns = c ("SYMBOL", "ENTREZID", "GENENAME"),
+                                  keytype = "ENSEMBL")
+
+NAFLD_vs_Control_annotated <- merge(NAFLD_vs_Control_top_table_p_value_cutoff, annots_1, by.x=1, by.y="ENSEMBL")
+
+NAFLD_vs_Control_annotated <- NAFLD_vs_Control_annotated[complete.cases(NAFLD_vs_Control_annotated[ , 8:9]),]
+
+write.csv(NAFLD_vs_Control_annotated,"./GSE135251_NAFL_vs_control_genes.csv", row.names = F)
+```
+<br>
+
+### NASH (all groups collapsed) vs Healthy control
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+NASH_contrast <- makeContrasts(NASH_score_collapsed_groupsNASH - NASH_score_collapsed_groupscontrol,
+                               levels = colnames(coef(fitted_linear_model)))
+NASH_contrast
+NASH_contrast_fitted <- contrasts.fit(fitted_linear_model, NASH_contrast)
+NASH_contrast_fitted <- eBayes(NASH_contrast_fitted)
+NASH_vs_Control_top_table <- topTable(NASH_contrast_fitted, sort.by = "P", n = Inf)
+head(NASH_vs_Control_top_table, 10) # Top 10 genes
+```
+<br>
+
+## Querying individual gene statistics for plotting
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+MEAF6_NAFLD_vs_control <- NAFLD_vs_Control_top_table["ENSG00000163875",]
+MEAF6_NAFLD_vs_control
+MEAF6_NASH_vs_control <- NASH_vs_Control_top_table["ENSG00000163875",]
+MEAF6_NASH_vs_control
+
+NEDD4L_NAFLD_vs_control <- NAFLD_vs_Control_top_table["ENSG00000049759",]
+NEDD4L_NAFLD_vs_control
+NEDD4L_NASH_vs_control <- NASH_vs_Control_top_table["ENSG00000049759",]
+NEDD4L_NASH_vs_control
+
+PRDX1_NAFLD_vs_control <- NAFLD_vs_Control_top_table["ENSG00000117450",]
+PRDX1_NAFLD_vs_control
+PRDX1_NASH_vs_control <- NASH_vs_Control_top_table["ENSG00000117450",]
+PRDX1_NASH_vs_control
+
+APCS_NAFLD_vs_control <- NAFLD_vs_Control_top_table["ENSG00000132703",]
+APCS_NAFLD_vs_control
+APCS_NASH_vs_control <- NASH_vs_Control_top_table["ENSG00000132703",]
+APCS_NASH_vs_control
+
+PREB_NAFLD_vs_control <- NAFLD_vs_Control_top_table["ENSG00000138073",]
+PREB_NAFLD_vs_control
+PREB_NASH_vs_control <- NASH_vs_Control_top_table["ENSG00000138073",]
+PREB_NASH_vs_control
+```
+<br>
+
+## Functionalize and interatively fit multinomial logistic regression model for:
+### Nash stages and fibrosis stages
+### Ranking genes according to goodness of fit metrics, Chi-sq and p-value.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# NASH stages with NAFL regression fitting
+library(org.Hs.eg.db)
+source("multinomial_logistic_regression.R")
+
+# Find all gene columns but not the first column which is the categorical column 
+regressors <- setdiff(colnames(RNA_seq_with_full_NASH_stages_arranged), "NASH_stages_full")
+# Cut off for genes with normalised CPM greater than 10
+regressors_cutoff <- regressors[colMeans(RNA_seq_with_full_NASH_stages_arranged[, regressors]) > 10]
+regressors_mini <- regressors[1:6000] # Small list for debugging
+
+all_mlr_olr <- mclapply(regressors_cutoff, function(x){
+  # Wrap fit_mlr_olr function inside anonymous function to allow default arguments for dataset and conditions
+  # But only mclapply to first argument x which is gene ID
+  # This allows wrapped function to be applied to list of genes in regressors list
+  result_full <- fit_mlr_olr(x, data_set = RNA_seq_with_full_NASH_stages_arranged, conditions = "NASH_stages_full")
+  result_full
+  }, mc.cores = 16)
+
+# mlr is multinomial logistic regression and olr is ordinal logistic regression
+all_mlr_olr_df <- data.frame(do.call(rbind, all_mlr_olr))
+all_mlr_olr_df_orderable <- as.data.frame(lapply(all_mlr_olr_df, unlist))
+all_mlr_olr_df_filtered <- all_mlr_olr_df_orderable[all_mlr_olr_df_orderable$X3 < 0.05,]
+all_mlr_olr_df_ordered <- all_mlr_olr_df_filtered[order(all_mlr_olr_df_filtered$X2), ]
+
+colnames(all_mlr_olr_df_ordered)[colnames(all_mlr_olr_df_ordered) == 'X1'] <- 'ENSEMBL_ID'
+colnames(all_mlr_olr_df_ordered)[colnames(all_mlr_olr_df_ordered) == 'X2'] <- 'Chi-square value'
+colnames(all_mlr_olr_df_ordered)[colnames(all_mlr_olr_df_ordered) == 'X3'] <- 'P-value'
+colnames(all_mlr_olr_df_ordered)[colnames(all_mlr_olr_df_ordered) == 'X4'] <- 'OLR coefficient'
+
+annots <- AnnotationDbi::select(org.Hs.eg.db,
+                                keys = all_mlr_olr_df_ordered$ENSEMBL_ID,
+                                columns = c ("SYMBOL", "ENTREZID", "GENENAME"),
+                                keytype = "ENSEMBL")
+all_mlr_olr_df_annotated <- merge(all_mlr_olr_df_ordered, annots, by.x=1, by.y="ENSEMBL")
+
+all_mlr_olr_df_annotated$`Proportional odds ratios` <- exp(all_mlr_olr_df_annotated$`OLR coefficient`)
+all_mlr_olr_df_annotated$`Percentage change in odds` <- ((all_mlr_olr_df_annotated$`Proportional odds ratios`) - 1) * 100
+
+# Adding percentiles
+all_mlr_olr_df_annotated$Chi_sq_percentile <- ecdf(all_mlr_olr_df_annotated$`Chi-square value`)(all_mlr_olr_df_annotated$`Chi-square value`)*100
+ggplot(all_mlr_olr_df_annotated, aes(`Chi-square value`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated$OLR_percentile <- ecdf(all_mlr_olr_df_annotated$`OLR coefficient`)(all_mlr_olr_df_annotated$`OLR coefficient`)*100
+ggplot(all_mlr_olr_df_annotated, aes(`OLR coefficient`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_percentile_cutoff <- all_mlr_olr_df_annotated
+# Filter based on two percentile columns, | for "or" and , for "and" conditions.
+all_mlr_olr_df_percentile_cutoff <- all_mlr_olr_df_percentile_cutoff %>% 
+  filter(all_mlr_olr_df_percentile_cutoff$Chi_sq_percentile > 90, all_mlr_olr_df_percentile_cutoff$OLR_percentile > 90)
+
+all_mlr_olr_df_annotated <- all_mlr_olr_df_annotated[complete.cases(all_mlr_olr_df_annotated[ , 5:7]),]
+
+write.csv(all_mlr_olr_df_annotated,"./NASH_genes.csv", row.names = FALSE)
+
+
+###################################################################################################################################
+###################################################################################################################################
+
+# Test plotting and multinomial logistic fit
+plot_test <- ggplot(RNA_seq_with_full_NASH_stages_arranged, aes(x = NASH_stages_full, y = ENSG00000160703, fill = NASH_stages_full)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("NLRX1 normalized CPM") +
+  expand_limits(y = 0)
+plot_test
+
+test_mlr <- multinom(NASH_stages_full ~ ENSG00000100439, data = RNA_seq_with_full_NASH_stages_arranged)
+summary(test_mlr)
+chisq.test(RNA_seq_with_full_NASH_stages_arranged$NASH_stages_full, predict(test_mlr), simulate.p.value = TRUE, B = 100000)
+
+# Ordinal logistic regression
+RNA_seq_with_full_NASH_stages_ordered <- RNA_seq_with_full_NASH_stages_arranged
+RNA_seq_with_full_NASH_stages_ordered$NASH_stages_full <- ordered(RNA_seq_with_full_NASH_stages_ordered$NASH_stages_full)
+
+olr <- polr(NASH_stages_full ~ ENSG00000110921, data = RNA_seq_with_full_NASH_stages_ordered, Hess=TRUE)
+summary(olr)
+as.numeric(olr$coefficients)
+```
+<br>
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Fibrosis stages regression fitting
+
+library(org.Hs.eg.db)
+source("multinomial_logistic_regression.R")
+# Find all gene columns but not the first column which is the categorical column 
+regressors_2 <- setdiff(colnames(RNA_seq_with_fibrosis_stages_arranged), "Fibrosis_stages")
+# Cut off for genes with normalised CPM greater than 10
+regressors_cutoff_2 <- regressors_2[colMeans(RNA_seq_with_fibrosis_stages_arranged[, regressors_2]) > 5]
+
+all_mlr_olr_2 <- mclapply(regressors_cutoff_2, function(x){
+  # Wrap fit_mlr_olr function inside anonymous function to allow default arguments for dataset and conditions
+  # But only mclapply to first argument x which is gene ID
+  # This allows wrapped function to be applied to list of genes in regressors list
+  result_full <- fit_mlr_olr(x, data_set = RNA_seq_with_fibrosis_stages_arranged, conditions = "Fibrosis_stages")
+  }, mc.cores = 16)
+
+# mlr is multinomial logistic regression and olr is ordinal logistic regression
+all_mlr_olr_df_2 <- data.frame(do.call(rbind, all_mlr_olr_2))
+all_mlr_olr_df_orderable_2 <- as.data.frame(lapply(all_mlr_olr_df_2, unlist))
+all_mlr_olr_df_filtered_2 <- all_mlr_olr_df_orderable_2[all_mlr_olr_df_orderable_2$X3 < 0.05,]
+all_mlr_olr_df_ordered_2 <- all_mlr_olr_df_filtered_2[order(all_mlr_olr_df_filtered_2$X2), ]
+
+colnames(all_mlr_olr_df_ordered_2)[colnames(all_mlr_olr_df_ordered_2) == 'X1'] <- 'ENSEMBL_ID'
+colnames(all_mlr_olr_df_ordered_2)[colnames(all_mlr_olr_df_ordered_2) == 'X2'] <- 'Chi-square value'
+colnames(all_mlr_olr_df_ordered_2)[colnames(all_mlr_olr_df_ordered_2) == 'X3'] <- 'P-value'
+colnames(all_mlr_olr_df_ordered_2)[colnames(all_mlr_olr_df_ordered_2) == 'X4'] <- 'OLR coefficient'
+
+annots_2 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = all_mlr_olr_df_ordered_2$ENSEMBL_ID,
+                                  columns = c ("SYMBOL", "ENTREZID", "GENENAME"),
+                                  keytype = "ENSEMBL")
+all_mlr_olr_df_annotated_2 <- merge(all_mlr_olr_df_ordered_2, annots_2, by.x=1, by.y="ENSEMBL")
+
+all_mlr_olr_df_annotated_2$`Proportional odds ratios` <- exp(all_mlr_olr_df_annotated_2$`OLR coefficient`)
+all_mlr_olr_df_annotated_2$`Percentage change in odds` <- ((all_mlr_olr_df_annotated_2$`Proportional odds ratios`) - 1) * 100
+
+# Adding percentiles
+all_mlr_olr_df_annotated_2$Chi_sq_percentile <-
+  ecdf(all_mlr_olr_df_annotated_2$`Chi-square value`)(all_mlr_olr_df_annotated_2$`Chi-square value`)*100
+ggplot(all_mlr_olr_df_annotated_2, aes(`Chi-square value`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated_2$OLR_percentile <-
+  ecdf(all_mlr_olr_df_annotated_2$`OLR coefficient`)(all_mlr_olr_df_annotated_2$`OLR coefficient`)*100
+ggplot(all_mlr_olr_df_annotated_2, aes(`OLR coefficient`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_percentile_cutoff_2 <- all_mlr_olr_df_annotated_2
+# Filter based on two percentile columns, | for "or" and , for "and" conditions.
+all_mlr_olr_df_percentile_cutoff_2 <- all_mlr_olr_df_percentile_cutoff_2 %>% 
+  filter(all_mlr_olr_df_percentile_cutoff_2$Chi_sq_percentile > 90, all_mlr_olr_df_percentile_cutoff_2$OLR_percentile > 90)
+
+all_mlr_olr_df_annotated_2 <- all_mlr_olr_df_annotated_2[complete.cases(all_mlr_olr_df_annotated_2[ , 5:7]),]
+
+write.csv(all_mlr_olr_df_annotated_2,"./NASH_Fib_genes.csv", row.names = FALSE)
+
+
+###################################################################################################################################
+###################################################################################################################################
+
+# Test plotting and multinomial logistic fit
+plot_test <- ggplot(RNA_seq_with_fibrosis_stages_arranged, aes(x = Fibrosis_stages, y = ENSG00000198074, fill = Fibrosis_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("test normalized CPM") +
+  expand_limits(y = 0)
+plot_test
+
+test_mlr <- multinom(Fibrosis_stages ~ ENSG00000198074, data = RNA_seq_with_fibrosis_stages_arranged)
+summary(test_mlr)
+chisq.test(RNA_seq_with_fibrosis_stages_arranged$Fibrosis_stages, predict(test_mlr), simulate.p.value = TRUE, B = 100000)
+
+# Ordinal logistic regression
+RNA_seq_with_full_NASH_stages_ordered <- RNA_seq_with_full_NASH_stages_arranged
+RNA_seq_with_full_NASH_stages_ordered$NASH_stages_full <- ordered(RNA_seq_with_full_NASH_stages_ordered$NASH_stages_full)
+
+olr <- polr(NASH_stages_full ~ ENSG00000001626, data = RNA_seq_with_full_NASH_stages_ordered, Hess=TRUE)
+summary(olr)
+as.numeric(olr$coefficients)
+
+###################################################################################################################################
+###################################################################################################################################
+
+# Fibrosis significant genes used as filter for NASH genes
+fibrosis_genes <- all_mlr_olr_df_ordered_2$ENSEMBL_ID
+NASH_genes <- all_mlr_olr_df_annotated
+NASH_genes_significant_with_fibrosis <- NASH_genes[NASH_genes$ENSEMBL_ID %in% fibrosis_genes,]
+
+write.csv(NASH_genes_significant_with_fibrosis,"./NASH_Fib_genes.csv", row.names = FALSE)
+
+```
+<br>
+
+
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# NASH stages regression fitting
+library(org.Hs.eg.db)
+source("multinomial_logistic_regression.R")
+
+# Remove NALF samples from total RNA group
+RNA_seq_without_NALF <- RNA_seq_with_full_NASH_stages_arranged
+RNA_seq_without_NALF <- subset(RNA_seq_without_NALF, NASH_stages_full != "NAFL")
+RNA_seq_without_NALF$NASH_stages_full <- droplevels(RNA_seq_without_NALF$NASH_stages_full) # Drop the level NAFL as it has been removed
+Only_control_and_NASH_samples <- rownames(RNA_seq_without_NALF)
+RNA_seq_Fibrosis_stages_without_NALF <- RNA_seq_with_fibrosis_stages_arranged
+RNA_seq_Fibrosis_stages_without_NALF <-
+  RNA_seq_Fibrosis_stages_without_NALF[(row.names(RNA_seq_Fibrosis_stages_without_NALF) %in% Only_control_and_NASH_samples), ]
+# Check for matching rownames between NASH samples and Fibrosis samples
+matched_disease_NASH_and_Fibrosis <- match(rownames(RNA_seq_without_NALF), rownames(RNA_seq_Fibrosis_stages_without_NALF))
+
+RNA_seq_Fibrosis_stages_without_NALF_arranged <- RNA_seq_Fibrosis_stages_without_NALF %>% arrange(Fibrosis_stages)
+RNA_seq_Fibrosis_stages_without_NALF_arranged$Fibrosis_stages <- 
+  relevel(as.factor(RNA_seq_Fibrosis_stages_without_NALF_arranged$Fibrosis_stages), ref = "fibrosis_stage_0")
+levels(RNA_seq_Fibrosis_stages_without_NALF_arranged$Fibrosis_stages)
+
+# Find all gene columns but not the first column which is the categorical column 
+regressors_3 <- setdiff(colnames(RNA_seq_without_NALF), "NASH_stages_full")
+regressors_4 <- setdiff(colnames(RNA_seq_Fibrosis_stages_without_NALF_arranged), "Fibrosis_stages")
+
+# Cut off for genes with normalised CPM greater than 10
+regressors_cutoff_3 <- regressors_3[colMeans(RNA_seq_without_NALF[, regressors_3]) > 5]
+regressors_cutoff_4 <- regressors_4[colMeans(RNA_seq_Fibrosis_stages_without_NALF_arranged[, regressors_4]) > 5]
+
+
+
+# For NASH stages but without NAFL
+all_mlr_olr_3 <- mclapply(regressors_cutoff_3, function(x){
+  # Wrap fit_mlr_olr function inside anonymous function to allow default arguments for dataset and conditions
+  # But only mclapply to first argument x which is gene ID
+  # This allows wrapped function to be applied to list of genes in regressors list
+  result_full <- fit_mlr_olr(x, data_set = RNA_seq_without_NALF, conditions = "NASH_stages_full")
+  }, mc.cores = 16)
+
+# For Fibrosis stages but without NAFL
+all_mlr_olr_4 <- mclapply(regressors_cutoff_4, function(x){
+  # Wrap fit_mlr_olr function inside anonymous function to allow default arguments for dataset and conditions
+  # But only mclapply to first argument x which is gene ID
+  # This allows wrapped function to be applied to list of genes in regressors list
+  result_full <- fit_mlr_olr(x, data_set = RNA_seq_Fibrosis_stages_without_NALF_arranged, conditions = "Fibrosis_stages")
+  }, mc.cores = 16)
+
+
+
+# mlr is multinomial logistic regression and olr is ordinal logistic regression
+# For NASH stages but without NAFL
+all_mlr_olr_df_3 <- data.frame(do.call(rbind, all_mlr_olr_3))
+all_mlr_olr_df_orderable_3 <- as.data.frame(lapply(all_mlr_olr_df_3, unlist))
+all_mlr_olr_df_filtered_3 <- all_mlr_olr_df_orderable_3[all_mlr_olr_df_orderable_3$X3 < 0.05,]
+all_mlr_olr_df_ordered_3 <- all_mlr_olr_df_filtered_3[order(all_mlr_olr_df_filtered_3$X2), ]
+
+colnames(all_mlr_olr_df_ordered_3)[colnames(all_mlr_olr_df_ordered_3) == 'X1'] <- 'ENSEMBL_ID'
+colnames(all_mlr_olr_df_ordered_3)[colnames(all_mlr_olr_df_ordered_3) == 'X2'] <- 'Chi-square value'
+colnames(all_mlr_olr_df_ordered_3)[colnames(all_mlr_olr_df_ordered_3) == 'X3'] <- 'P-value'
+colnames(all_mlr_olr_df_ordered_3)[colnames(all_mlr_olr_df_ordered_3) == 'X4'] <- 'OLR coefficient'
+
+# For Fibrosis stages but without NAFL
+all_mlr_olr_df_4 <- data.frame(do.call(rbind, all_mlr_olr_4))
+all_mlr_olr_df_orderable_4 <- as.data.frame(lapply(all_mlr_olr_df_4, unlist))
+all_mlr_olr_df_filtered_4 <- all_mlr_olr_df_orderable_4[all_mlr_olr_df_orderable_4$X3 < 0.05,]
+all_mlr_olr_df_ordered_4 <- all_mlr_olr_df_filtered_4[order(all_mlr_olr_df_filtered_4$X2), ]
+
+colnames(all_mlr_olr_df_ordered_4)[colnames(all_mlr_olr_df_ordered_4) == 'X1'] <- 'ENSEMBL_ID'
+colnames(all_mlr_olr_df_ordered_4)[colnames(all_mlr_olr_df_ordered_4) == 'X2'] <- 'Chi-square value'
+colnames(all_mlr_olr_df_ordered_4)[colnames(all_mlr_olr_df_ordered_4) == 'X3'] <- 'P-value'
+colnames(all_mlr_olr_df_ordered_4)[colnames(all_mlr_olr_df_ordered_4) == 'X4'] <- 'OLR coefficient'
+
+
+
+###################################################################################################################################
+###################################################################################################################################
+
+# Test plotting and multinomial logistic fit
+RNA_seq_without_NALF_2 <- RNA_seq_without_NALF
+# Removed NAFL so rename NASH_stages_full column to NASH_stages
+colnames(RNA_seq_without_NALF_2)[colnames(RNA_seq_without_NALF_2) == 'NASH_stages_full'] <- 'NASH_stages'
+
+plot_test <- ggplot(RNA_seq_without_NALF_2, aes(x = NASH_stages, y = ENSG00000066135, fill = NASH_stages)) + 
+  geom_boxplot(outlier.colour = "red") +
+  geom_jitter(color="black", size=0.4, alpha=0.9) +
+  ylab("KDM4A normalized CPM") +
+  expand_limits(y = 0)
+plot_test
+
+###################################################################################################################################
+###################################################################################################################################
+
+
+
+# Gene annotations with HGNC Symbols, Entrez IDs and Gene names
+annots_3 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = all_mlr_olr_df_ordered_3$ENSEMBL_ID,
+                                  columns = c ("SYMBOL", "ENTREZID", "GENENAME"),
+                                  keytype = "ENSEMBL")
+all_mlr_olr_df_annotated_3 <- merge(all_mlr_olr_df_ordered_3, annots_3, by.x=1, by.y="ENSEMBL")
+
+all_mlr_olr_df_annotated_3$`Proportional odds ratios` <- exp(all_mlr_olr_df_annotated_3$`OLR coefficient`)
+all_mlr_olr_df_annotated_3$`Percentage change in odds` <- ((all_mlr_olr_df_annotated_3$`Proportional odds ratios`) - 1) * 100
+
+annots_4 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = all_mlr_olr_df_ordered_4$ENSEMBL_ID,
+                                  columns = c ("SYMBOL", "ENTREZID", "GENENAME"),
+                                  keytype = "ENSEMBL")
+all_mlr_olr_df_annotated_4 <- merge(all_mlr_olr_df_ordered_4, annots_4, by.x=1, by.y="ENSEMBL")
+
+all_mlr_olr_df_annotated_4$`Proportional odds ratios` <- exp(all_mlr_olr_df_annotated_4$`OLR coefficient`)
+all_mlr_olr_df_annotated_4$`Percentage change in odds` <- ((all_mlr_olr_df_annotated_4$`Proportional odds ratios`) - 1) * 100
+
+
+
+# Adding percentiles
+all_mlr_olr_df_annotated_3$Chi_sq_percentile <-
+  ecdf(all_mlr_olr_df_annotated_3$`Chi-square value`)(all_mlr_olr_df_annotated_3$`Chi-square value`)*100
+ggplot(all_mlr_olr_df_annotated_3, aes(`Chi-square value`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated_3$OLR_percentile <-
+  ecdf(all_mlr_olr_df_annotated_3$`OLR coefficient`)(all_mlr_olr_df_annotated_3$`OLR coefficient`)*100
+ggplot(all_mlr_olr_df_annotated_3, aes(`OLR coefficient`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated_3 <- all_mlr_olr_df_annotated_3[complete.cases(all_mlr_olr_df_annotated_3[ , 5:7]),]
+
+all_mlr_olr_df_annotated_4$Chi_sq_percentile <-
+  ecdf(all_mlr_olr_df_annotated_4$`Chi-square value`)(all_mlr_olr_df_annotated_4$`Chi-square value`)*100
+ggplot(all_mlr_olr_df_annotated_4, aes(`Chi-square value`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated_4$OLR_percentile <-
+  ecdf(all_mlr_olr_df_annotated_4$`OLR coefficient`)(all_mlr_olr_df_annotated_4$`OLR coefficient`)*100
+ggplot(all_mlr_olr_df_annotated_4, aes(`OLR coefficient`)) + stat_ecdf(geom = "step")
+
+all_mlr_olr_df_annotated_4 <- all_mlr_olr_df_annotated_4[complete.cases(all_mlr_olr_df_annotated_4[ , 5:7]),]
+
+
+
+all_mlr_olr_df_percentile_cutoff_2 <- all_mlr_olr_df_annotated_2
+# Filter based on two percentile columns, | for "or" and , for "and" conditions.
+all_mlr_olr_df_percentile_cutoff_2 <- all_mlr_olr_df_percentile_cutoff_2 %>% 
+  filter(all_mlr_olr_df_percentile_cutoff_2$Chi_sq_percentile > 90, all_mlr_olr_df_percentile_cutoff_2$OLR_percentile > 90)
+
+
+
+# Fibrosis significant genes used as filter for NASH genes
+fibrosis_genes_2 <- all_mlr_olr_df_annotated_4$ENSEMBL_ID
+NASH_genes_2 <- all_mlr_olr_df_annotated_3
+NASH_genes_significant_with_fibrosis_2 <- NASH_genes_2[NASH_genes_2$ENSEMBL_ID %in% fibrosis_genes_2, ]
+
+write.csv(NASH_genes_significant_with_fibrosis_2,"./NASH_Fib_genes.csv", row.names = FALSE)
+
+```
+
+
+
+## Functional enrichment analysis of NAFLD & NASH vs healthy control DEGs
+```{r}
+
+```
+

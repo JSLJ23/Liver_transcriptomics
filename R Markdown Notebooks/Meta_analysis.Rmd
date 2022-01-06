@@ -1,0 +1,131 @@
+---
+title: "Meta analysis"
+author: "Joshua Soon"
+date: "11/30/2021"
+output: html_document
+---
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(plotrix) # For rescale() function
+library(igraph)
+
+meta_analysis <- read.csv("/home/joshua-talo/R-projects/Liver_transcriptomics/data/meta_analysis_data.csv")
+meta_analysis$avgSpearmCor <- rowMeans(meta_analysis[, 6:10]) # Get mean of all pairwise correlations between pairs of genes.
+
+# Get necessary columns from meta_analysis dataframe to generate edge list.
+meta_analysis_igraph_df <- data.frame(meta_analysis$GeneSymbol1, meta_analysis$GeneSymbol2, meta_analysis$avgSpearmCor)
+
+# Construct igraph object.
+meta_analysis_igraph <- graph.data.frame(meta_analysis_igraph_df, directed = FALSE)
+
+c_scale_positive <- colorRamp(c('white', 'green4'))
+c_scale_negative <- colorRamp(c('white', 'red4'))
+c_scale_chisq <- colorRamp(c('white', 'magenta1', 'magenta3'))
+
+# Proportional colour shade scaling with respect to average spearman's correlation coefficient between genes.
+E(meta_analysis_igraph)$color[E(meta_analysis_igraph)$meta_analysis.avgSpearmCor > 0] <-
+  apply(c_scale_positive(E(meta_analysis_igraph)$meta_analysis.avgSpearmCor[E(meta_analysis_igraph)$meta_analysis.avgSpearmCor > 0]),
+        1,
+        function(x) rgb(x[1]/255,x[2]/255,x[3]/255))
+
+E(meta_analysis_igraph)$color[E(meta_analysis_igraph)$meta_analysis.avgSpearmCor < 0] <-
+  apply(c_scale_negative(abs(E(meta_analysis_igraph)$meta_analysis.avgSpearmCor[E(meta_analysis_igraph)$meta_analysis.avgSpearmCor < 0])),
+        1,
+        function(x) rgb(x[1]/255,x[2]/255,x[3]/255))
+
+
+E(meta_analysis_igraph)$weight <- abs(E(meta_analysis_igraph)$meta_analysis.avgSpearmCor)
+
+# Compute note properties like number of incoming edges and total edge weights.
+# Degree is the number of edges connected to a node, in this case the number of other genes it a specific gene is correlated to.
+Connectiveness <- degree(meta_analysis_igraph, mode="all")
+# Strength is the sum of all the weights of the connected edges to a target node, in this case the summed correlation a specific gene has with other genes.
+Total_correlation <- strength(meta_analysis_igraph, mode="all")
+
+gene_properties <- data.frame(Connectiveness, Total_correlation)
+gene_properties$Average_correlation <- gene_properties$Total_correlation / gene_properties$Connectiveness
+
+# Getting chi-square statistics from dataframe generated from regression fits of gene expression across NASH disease stages.
+STM_2020_chisq <- all_mlr_olr_df_annotated_3[all_mlr_olr_df_annotated_3$SYMBOL %in% row.names(gene_properties), ]
+STM_2020_chisq_vals <- data.frame(STM_2020_chisq$SYMBOL, STM_2020_chisq$`Chi-square value`)
+
+# Combine STM_2020_chisq_vals to gene_properties dataframe for subsequent CSV export.
+gene_properties_combined <- merge(gene_properties, STM_2020_chisq, by.x=0, by.y='SYMBOL', all.x = TRUE)
+
+write.csv(gene_properties_combined,"./gene_correlation_network.csv", row.names = F)
+
+
+# Add chi-square goodness of fit statistics from 2020 STM study as vertex attributes.
+meta_analysis_igraph <- set_vertex_attr(graph = meta_analysis_igraph,
+                                        name = "chi_sq",
+                                        index = STM_2020_chisq_vals$STM_2020_chisq.SYMBOL,
+                                        value = STM_2020_chisq_vals$STM_2020_chisq..Chi.square.value.)
+
+V(meta_analysis_igraph)$chi_sq
+
+V(meta_analysis_igraph)$color[is.na(V(meta_analysis_igraph)$chi_sq)] <- "gold"
+
+# Add a new vertex attribute named chi-square rescaled so as to not override original chi-square value.
+# Use rescale() function from plotrix to rescale chi-square values from 0 to 1, to fit into colour scale function from colorRamp.
+V(meta_analysis_igraph)$chi_sq_rescaled[!is.na(V(meta_analysis_igraph)$chi_sq)] <-
+  rescale(V(meta_analysis_igraph)$chi_sq[!is.na(V(meta_analysis_igraph)$chi_sq)], c(0, 1))
+
+# Conditional selection of Vertices (nodes) which do not have NA for the vertex attribute of "chi_sq_rescaled".
+# Based on the scaled chi-sq values, compute the respective RGB values for the colour spectrum across the colourRamp, map those values into the RGB function to obtain hex colour values which get assigned to the vertex colour attribute.
+V(meta_analysis_igraph)$color[!is.na(V(meta_analysis_igraph)$chi_sq_rescaled)] <-
+  apply(c_scale_chisq(V(meta_analysis_igraph)$chi_sq_rescaled[!is.na(V(meta_analysis_igraph)$chi_sq_rescaled)]),
+        1,
+        function(x) rgb(x[1]/255,x[2]/255,x[3]/255))
+
+
+set.seed(123)
+plot(meta_analysis_igraph,
+     vertex.size = 4, vertex.label = V(meta_analysis_igraph)$name, vertex.label.cex = 0.6, vertex.label.family="Helvetica",
+     vertex.frame.color = "black",
+     edge.width = E(meta_analysis_igraph)$weight^3 * 20, # Edge with scaling with respect to gene expression correlation
+     layout = layout.fruchterman.reingold,
+     asp = 9/16)
+
+
+```
+
+
+```{r}
+# Demo for colour scaling to edge weight
+# Create a random weighted graph
+g = erdos.renyi.game(10,0.5)
+E(g)$weight = runif(ecount(g))
+
+# Color scaling function
+c_scale <- colorRamp(c('red', 'white', 'green'))
+
+# Applying the color scale to edge weights.
+# rgb method is to convert colors to a character vector.
+E(g)$color = apply(c_scale(E(g)$weight), 1, function(x) rgb(x[1]/255,x[2]/255,x[3]/255) )
+
+# plot using igraph
+plot.igraph(g, edge.width = 4)
+```
+
+
+```{r}
+library(RColorBrewer)
+pal <- brewer.pal(4,"Accent")
+g <- make_graph("Cubical")
+Group <- gl(4, 2, labels = c("G","P","O","Y"))
+vertex.col <- pal[Group]
+
+plot(g, 
+     layout=layout.fruchterman.reingold(g),
+     vertex.label.color="black",
+     vertex.frame.color="black",
+     edge.color="black", 
+     vertex.color=vertex.col, 
+     main="Cubical")
+
+legend("topleft",bty = "n",
+       legend=levels(Group),
+       fill=pal, border=NA)
+```
+
